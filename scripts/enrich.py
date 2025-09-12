@@ -2,25 +2,16 @@
 """
 scripts/enrich.py — production-grade, proof-backed email enricher
 
-Implements:
- 1) STARTTLS upgrade when advertised
- 2) 4xx retries with backoff and retry scheduler
- 3) Confidence scoring (_score)
- 4) Full SMTP transcript capture saved per-check
- 5) Configurable MAIL FROM list (rotation)
- 6) Alternate ports (25,587,465) and implicit TLS attempt
- 7) Retry queue for 4xx responses
- 8) Tight rate-limiting: per-host semaphores + per-MX minimum interval + global cap
- 9) Scoring & flags in CSV (_score, _smtp_transcript_path)
-10) --skip-smtp fallback (scrape + MX heuristics)
-
-Usage example:
-  python3 scripts/enrich.py --input filtered_companies.csv --output enriched_verified.csv \
-      --concurrency 30 --smtp-timeout 8 --mx-timeout 6 --mail-from-list mailfroms.txt --ports 25,587,465
-
-Notes:
- - Run this from a machine with SMTP egress (port 25) or use --skip-smtp for CI (less accurate).
- - Transcripts are saved to ./transcripts/ by default and the CSV will include _smtp_transcript_path.
+Features:
+ - deterministic domain guessing
+ - MX lookup (cached)
+ - SMTP probe (EHLO, optional STARTTLS, MAIL FROM, RCPT TO) via smtplib in a threadpool
+ - implicit TLS attempt on port 465
+ - per-host semaphores + per-host minimum interval + global concurrency cap
+ - temporary (4xx) retry scheduler with exponential backoff
+ - transcript capture per probe saved to ./transcripts/
+ - scraping fallback for visible emails (when --skip-smtp or SMTP blocked)
+ - streaming CSV input/output; stops when --target enriched rows written
 """
 
 from __future__ import annotations
@@ -45,25 +36,33 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import dns.resolver
+import warnings
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 
+# ---------------- config & constants ----------------
 LOG = logging.getLogger("enricher")
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
 TLD_CANDIDATES = [".com", ".co.uk", ".uk", ".net", ".io", ".co", ".biz", ".org"]
 CONTACT_PAGES = ["/", "/contact", "/contact-us", "/about", "/about-us", "/team", "/staff", "/people", "/privacy"]
-ROLE_LOCALPARTS = {"admin", "administrator", "postmaster", "hostmaster", "info", "contact", "sales", "support", "help", "billing", "webmaster", "noreply", "no-reply", "newsletter"}
+ROLE_LOCALPARTS = {
+    "admin", "administrator", "postmaster", "hostmaster", "info", "contact", "sales", "support",
+    "help", "billing", "webmaster", "noreply", "no-reply", "newsletter"
+}
 COMMON_DISPOSABLE = {"mailinator.com", "tempmail.com", "10minutemail.com", "yopmail.com", "dispostable.com"}
 HTML_HEURISTIC_BYTES = 512
 TRANSCRIPTS_DIR = Path("transcripts")
-TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Optional email-validator for better syntax checks
+# optional email-validator for better syntactic checks
 try:
-    from email_validator import validate_email as ev_validate, EmailNotValidError
+    from email_validator import validate_email as ev_validate, EmailNotValidError  # type: ignore
 except Exception:
     ev_validate = None
     EmailNotValidError = Exception
+
+# ---------------- utilities ----------------
+
 
 def slug_company(name: str) -> str:
     if not name:
@@ -73,6 +72,7 @@ def slug_company(name: str) -> str:
     s = re.sub(r"\b(ltd|limited|co|company|inc|llc|plc)\b", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s.replace(" ", "") if s else ""
+
 
 def gen_domains(company_name: str) -> List[str]:
     base = slug_company(company_name)
@@ -92,21 +92,24 @@ def gen_domains(company_name: str) -> List[str]:
             seen.add(d)
     return dedup
 
+
 def _looks_like_html(txt: str) -> bool:
     if not txt:
         return False
     sample = txt.lstrip()[:HTML_HEURISTIC_BYTES]
     return bool(re.search(r"<[a-zA-Z!\/]", sample) or ("@" in sample))
 
+
 @contextmanager
 def _suppress_bs4_warning():
-    import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
         yield
 
+
 def is_role_local(local: str) -> bool:
     return local.lower() in ROLE_LOCALPARTS
+
 
 def is_disposable_domain(domain: str, extras: Optional[Set[str]] = None) -> bool:
     s = set(COMMON_DISPOSABLE)
@@ -114,10 +117,12 @@ def is_disposable_domain(domain: str, extras: Optional[Set[str]] = None) -> bool
         s |= extras
     return domain.lower() in s
 
+
 def random_localpart() -> str:
     return "probe" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
-# MX cache with threaded resolver
+
+# ---------------- MX resolver cache ----------------
 class MXCache:
     def __init__(self, mx_timeout: float = 6.0, threads: int = 8):
         self.mx_timeout = float(mx_timeout)
@@ -130,6 +135,7 @@ class MXCache:
             pairs = sorted([(r.preference, str(r.exchange).rstrip(".")) for r in ans], key=lambda x: x[0])
             return pairs
         except Exception:
+            # fallback to A
             try:
                 ans = dns.resolver.resolve(domain, "A", lifetime=self.mx_timeout)
                 return [(0, str(ans[0]))]
@@ -150,7 +156,8 @@ class MXCache:
         except Exception:
             pass
 
-# Blocking SMTP prober executed in threadpool (uses smtplib to support STARTTLS/implicit TLS reliably)
+
+# ---------------- blocking SMTP prober (smtplib) ----------------
 class SMTPProbeResult:
     def __init__(self, code: Optional[int], message: Optional[str], transcript: str, port: int, used_tls: bool):
         self.code = code
@@ -158,6 +165,7 @@ class SMTPProbeResult:
         self.transcript = transcript
         self.port = port
         self.used_tls = used_tls
+
 
 class SMTPProber:
     def __init__(self, smtp_timeout: float = 8.0, threads: int = 20):
@@ -183,12 +191,13 @@ class SMTPProber:
                     pass
                 try:
                     if try_starttls and (not implicit_tls):
-                        if smtp.has_extn('starttls'):
+                        if smtp.has_extn("starttls"):
                             try:
                                 smtp.starttls(context=context)
                                 used_tls = True
                                 smtp.ehlo()
                             except Exception:
+                                # failed STARTTLS; continue without TLS
                                 pass
                 except Exception:
                     pass
@@ -224,12 +233,13 @@ class SMTPProber:
         except Exception:
             pass
 
-# Verifier orchestrates MX + SMTP probes, caching, rate-limiting, catch-all detection
+
+# ---------------- verifier orchestrator ----------------
 class Verifier:
     def __init__(self, args):
         self.args = args
-        self.mx_cache = MXCache(mx_timeout=args.mx_timeout, threads=8)
-        self.prober = SMTPProber(smtp_timeout=args.smtp_timeout, threads=32)
+        self.mx_cache = MXCache(mx_timeout=args.mx_timeout, threads=max(2, min(32, args.concurrency)))
+        self.prober = SMTPProber(smtp_timeout=args.smtp_timeout, threads=max(4, min(64, args.concurrency * 2)))
         self.global_semaphore = asyncio.Semaphore(args.global_limit)
         self.per_host_semaphores: Dict[str, asyncio.Semaphore] = {}
         self.per_host_min_interval: Dict[str, float] = {}
@@ -252,7 +262,7 @@ class Verifier:
         p = Path(path)
         if not p.exists():
             return [self.args.mail_from]
-        out = []
+        out: List[str] = []
         with open(p, encoding="utf-8") as f:
             for ln in f:
                 s = ln.strip()
@@ -292,7 +302,8 @@ class Verifier:
                     try_starttls = (not implicit_tls)
                     res = await self.prober.probe(host, port, mail_from, email, try_starttls, implicit_tls)
                     self.last_probe_at[host] = time.time()
-                    if res.code is None and "connect-error" in (res.message or ""):
+                    # if connect-error substring present and no code, try next port
+                    if res.code is None and ("connect-error" in (res.message or "")):
                         continue
                     return res
         return None
@@ -301,6 +312,7 @@ class Verifier:
         if not mx_pairs:
             return {"status": "no_mx", "_score": 0}
         domain = email.rsplit("@", 1)[-1]
+        # detect catch-all once per domain
         if domain not in self.catch_all_cache:
             pref, host = mx_pairs[0]
             mail_from = self._next_mail_from()
@@ -312,6 +324,7 @@ class Verifier:
                 catch = True
             self.catch_all_cache[domain] = catch
         catch_flag = self.catch_all_cache.get(domain, False)
+        # try MX hosts in order
         for pref, host in mx_pairs:
             mail_from = self._next_mail_from()
             probe = await self._probe_mx_host(host, self.args.ports, mail_from, email)
@@ -342,10 +355,17 @@ class Verifier:
             else:
                 status = "unknown"
                 score = 30
-            return {"status": status, "_smtp_code": code, "_smtp_message": msg, "_catch_all": catch_flag, "_score": score, "_smtp_transcript_path": str(fn)}
+            return {
+                "status": status,
+                "_smtp_code": code,
+                "_smtp_message": msg,
+                "_catch_all": catch_flag,
+                "_score": score,
+                "_smtp_transcript_path": str(fn),
+            }
         return {"status": "no_response", "_score": 10}
 
-# Scraping fallback
+# ---------------- scraping fallback ----------------
 async def scrape_for_emails(session: aiohttp.ClientSession, domain: str, http_timeout: float) -> Set[str]:
     found: Set[str] = set()
     schemes = ["https://", "http://"]
@@ -377,6 +397,8 @@ async def scrape_for_emails(session: aiohttp.ClientSession, domain: str, http_ti
                 continue
     return found
 
+
+# ---------------- syntax validation ----------------
 def validate_syntax(email: str) -> Tuple[bool, Optional[str]]:
     if not email or "@" not in email:
         return False, None
@@ -389,7 +411,8 @@ def validate_syntax(email: str) -> Tuple[bool, Optional[str]]:
     except Exception:
         return False, None
 
-# Enricher pipeline with retry scheduler for temporary (4xx) results
+
+# ---------------- Enricher (queue + worker + retry scheduler) ----------------
 class Enricher:
     def __init__(self, args):
         self.args = args
@@ -397,11 +420,14 @@ class Enricher:
         self.http_timeout = args.http_timeout
         self.retries_queue: List[Tuple[float, Dict]] = []  # (run_at, payload)
         self.retry_lock = asyncio.Lock()
+        # counter for enriched rows written
+        self._found_count = 0
+        self._found_count_lock = asyncio.Lock()
 
     async def _retry_scheduler(self, main_queue: asyncio.Queue, stop_event: asyncio.Event):
         while not stop_event.is_set():
             now = time.time()
-            to_move = []
+            to_move: List[Dict] = []
             async with self.retry_lock:
                 i = 0
                 while i < len(self.retries_queue):
@@ -442,32 +468,65 @@ class Enricher:
             is_role = is_role_local(local)
             is_disp = is_disposable_domain(domain, self.verifier.disposable_set)
 
+            # skip SMTP entirely if requested
             if self.args.skip_smtp:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.http_timeout)) as session_local:
                     emails = await scrape_for_emails(session_local, domain, self.http_timeout)
                     if emails:
                         first = sorted(emails)[0]
                         enriched = dict(row)
-                        enriched.update({"_found_email": first, "_verification_status": "found_via_scrape", "_smtp_code": "", "_smtp_message": "", "_catch_all": False, "_is_disposable": is_disp, "_is_role": is_role, "_score": 50, "_checked_at": ts})
+                        enriched.update({
+                            "_found_email": first,
+                            "_verification_status": "found_via_scrape",
+                            "_smtp_code": "",
+                            "_smtp_message": "",
+                            "_catch_all": False,
+                            "_is_disposable": is_disp,
+                            "_is_role": is_role,
+                            "_score": 50,
+                            "_checked_at": ts,
+                        })
                         return enriched
                     else:
                         enriched = dict(row)
-                        enriched.update({"_found_email": email_norm, "_verification_status": "no_smtp_no_scrape", "_smtp_code": "", "_smtp_message": "", "_catch_all": False, "_is_disposable": is_disp, "_is_role": is_role, "_score": 10, "_checked_at": ts})
+                        enriched.update({
+                            "_found_email": email_norm,
+                            "_verification_status": "no_smtp_no_scrape",
+                            "_smtp_code": "",
+                            "_smtp_message": "",
+                            "_catch_all": False,
+                            "_is_disposable": is_disp,
+                            "_is_role": is_role,
+                            "_score": 10,
+                            "_checked_at": ts,
+                        })
                         return enriched
 
+            # MX lookup
             mx_pairs = await self.verifier.mx_cache.get_mx(domain)
             if not mx_pairs:
                 enriched = dict(row)
-                enriched.update({"_found_email": email_norm, "_verification_status": "no_mx", "_smtp_code": "", "_smtp_message": "", "_catch_all": False, "_is_disposable": is_disp, "_is_role": is_role, "_score": 0, "_checked_at": ts})
+                enriched.update({
+                    "_found_email": email_norm,
+                    "_verification_status": "no_mx",
+                    "_smtp_code": "",
+                    "_smtp_message": "",
+                    "_catch_all": False,
+                    "_is_disposable": is_disp,
+                    "_is_role": is_role,
+                    "_score": 0,
+                    "_checked_at": ts,
+                })
                 return enriched
 
+            # SMTP verify (may return temporary)
             result = await self.verifier.verify_address(email_norm, mx_pairs)
             status = result.get("status")
             score = result.get("_score", 0)
             transcript_path = result.get("_smtp_transcript_path", "")
 
             if status == "temporary":
-                retries = int(row.get("_retries", 0))
+                retries = int(row.get("_retries", 0) or 0)
                 if retries < self.args.temporary_retries:
                     delay = self.args.temporary_backoff * (2 ** retries)
                     payload = dict(row)
@@ -479,11 +538,33 @@ class Enricher:
                     continue
                 else:
                     enriched = dict(row)
-                    enriched.update({"_found_email": email_norm, "_verification_status": "unknown_after_retries", "_smtp_code": result.get("_smtp_code", ""), "_smtp_message": result.get("_smtp_message", ""), "_catch_all": result.get("_catch_all", False), "_is_disposable": is_disp, "_is_role": is_role, "_score": result.get("_score", 40), "_smtp_transcript_path": transcript_path, "_checked_at": ts})
+                    enriched.update({
+                        "_found_email": email_norm,
+                        "_verification_status": "unknown_after_retries",
+                        "_smtp_code": result.get("_smtp_code", ""),
+                        "_smtp_message": result.get("_smtp_message", ""),
+                        "_catch_all": result.get("_catch_all", False),
+                        "_is_disposable": is_disp,
+                        "_is_role": is_role,
+                        "_score": result.get("_score", 40),
+                        "_smtp_transcript_path": transcript_path,
+                        "_checked_at": ts,
+                    })
                     return enriched
 
             enriched = dict(row)
-            enriched.update({"_found_email": email_norm, "_verification_status": status, "_smtp_code": result.get("_smtp_code", ""), "_smtp_message": result.get("_smtp_message", ""), "_catch_all": result.get("_catch_all", False), "_is_disposable": is_disp, "_is_role": is_role, "_score": score, "_smtp_transcript_path": transcript_path, "_checked_at": ts})
+            enriched.update({
+                "_found_email": email_norm,
+                "_verification_status": status,
+                "_smtp_code": result.get("_smtp_code", ""),
+                "_smtp_message": result.get("_smtp_message", ""),
+                "_catch_all": result.get("_catch_all", False),
+                "_is_disposable": is_disp,
+                "_is_role": is_role,
+                "_score": score,
+                "_smtp_transcript_path": transcript_path,
+                "_checked_at": ts,
+            })
             return enriched
         return None
 
@@ -503,41 +584,78 @@ class Enricher:
             with open(in_path, newline="", encoding="utf-8", errors="replace") as inf:
                 reader = csv.DictReader(inf)
                 in_fields = reader.fieldnames or []
-                out_fields = list(in_fields) + ["_found_email", "_verification_status", "_smtp_code", "_smtp_message", "_catch_all", "_is_disposable", "_is_role", "_score", "_smtp_transcript_path", "_checked_at"]
+                out_fields = list(in_fields) + [
+                    "_found_email", "_verification_status", "_smtp_code", "_smtp_message", "_catch_all",
+                    "_is_disposable", "_is_role", "_score", "_smtp_transcript_path", "_checked_at"
+                ]
                 with open(out_path, "w", newline="", encoding="utf-8") as outf:
                     writer = csv.DictWriter(outf, fieldnames=out_fields, extrasaction="ignore")
                     writer.writeheader()
-                    q = asyncio.Queue(maxsize=10000)
+                    # In-memory queue + controls
+                    q: asyncio.Queue = asyncio.Queue(maxsize=10000)
                     stop_ev = asyncio.Event()
+
+                    # spawn workers
                     concurrency = max(2, min(self.args.concurrency, 200))
-                    workers = [asyncio.create_task(self._worker_loop(q, writer, session, stop_ev)) for _ in range(concurrency)]
+                    workers = [
+                        asyncio.create_task(self._worker_loop(q, writer, outf, session, stop_ev))
+                        for _ in range(concurrency)
+                    ]
                     sched = asyncio.create_task(self._retry_scheduler(q, stop_ev))
 
-                    pushed = 0
+                    processed = 0
+                    # handle signals gracefully
+                    loop = asyncio.get_event_loop()
+                    stop_called = False
+
+                    def _signal_handler():
+                        nonlocal stop_called
+                        if not stop_called:
+                            LOG.info("Received termination signal, stopping gracefully...")
+                            stop_ev.set()
+                            stop_called = True
+
+                    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+                        if sig is None:
+                            continue
+                        try:
+                            loop.add_signal_handler(sig, _signal_handler)
+                        except NotImplementedError:
+                            pass
+
                     try:
                         for row in reader:
                             if stop_ev.is_set():
                                 break
-                            await q.put(row)
-                            pushed += 1
-                            if pushed % 500 == 0:
-                                LOG.info("Queued rows: %d", pushed)
-                        while not q.empty() or (self.retries_queue and not stop_ev.is_set()):
+                            # ensure we put a dict (csv.DictReader returns OrderedDict)
+                            await q.put(dict(row))
+                            processed += 1
+                            if processed % 500 == 0:
+                                LOG.info("Queued rows: %d", processed)
+                        # wait until queue drained or target reached
+                        while (not q.empty() or (self.retries_queue and not stop_ev.is_set())) and (not stop_ev.is_set()):
+                            # check target periodically
+                            async with self._found_count_lock:
+                                if getattr(self.args, "target", None) is not None and self._found_count >= int(self.args.target):
+                                    LOG.info("Target reached (%d). Stopping producer loop.", self._found_count)
+                                    stop_ev.set()
+                                    break
                             await asyncio.sleep(0.5)
                     finally:
                         stop_ev.set()
                         await asyncio.gather(*workers, return_exceptions=True)
                         sched.cancel()
 
+        # cleanup threadpools
         try:
             self.verifier.mx_cache.shutdown()
             self.verifier.prober.shutdown()
         except Exception:
             pass
-        LOG.info("Finished. Approx queued rows: %d", pushed)
+        LOG.info("Finished. Processed rows (pushed): approx %d; Enriched written: %d", processed, self._found_count)
         return 0
 
-    async def _worker_loop(self, q: asyncio.Queue, writer: csv.DictWriter, session: aiohttp.ClientSession, stop_ev: asyncio.Event):
+    async def _worker_loop(self, q: asyncio.Queue, writer: csv.DictWriter, outf, session: aiohttp.ClientSession, stop_ev: asyncio.Event):
         while not stop_ev.is_set():
             try:
                 row = await asyncio.wait_for(q.get(), timeout=1.0)
@@ -546,15 +664,35 @@ class Enricher:
             try:
                 enriched = await self._process_row(row, session)
                 if enriched:
-                    writer.writerow(enriched)
+                    try:
+                        writer.writerow(enriched)
+                        # flush + fsync to ensure file is updated promptly for CI / early stop
+                        try:
+                            outf.flush()
+                            try:
+                                os.fsync(outf.fileno())
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        # increment counter and check target
+                        async with self._found_count_lock:
+                            self._found_count += 1
+                            if getattr(self.args, "target", None) is not None and self._found_count >= int(self.args.target):
+                                LOG.info("Target reached (%d). Signalling stop.", self._found_count)
+                                stop_ev.set()
+                    except Exception:
+                        LOG.exception("Failed to write enriched row")
             except Exception:
-                LOG.exception("Worker error")
+                LOG.exception("Worker error while processing row")
             finally:
                 try:
                     q.task_done()
                 except Exception:
                     pass
 
+
+# ---------------- CLI / main ----------------
 def parse_args():
     p = argparse.ArgumentParser(description="Enricher — MX + SMTP + STARTTLS + retries + scoring")
     p.add_argument("--input", required=True)
@@ -574,11 +712,17 @@ def parse_args():
     p.add_argument("--global-limit", type=int, default=50)
     p.add_argument("--temporary-retries", type=int, default=2, help="Retries for 4xx temporary codes")
     p.add_argument("--temporary-backoff", type=float, default=30.0, help="Base backoff seconds for temporary retries; exponential")
+
+    # STOP when this many enriched rows are written (useful in CI)
+    p.add_argument("--target", type=int, default=10000, help="Stop after this many enriched rows are written")
+
     return p.parse_args()
+
 
 def main():
     args = parse_args()
-    args.ports = [int(x.strip()) for x in args.ports.split(",") if x.strip().isdigit()]
+    # normalize ports
+    args.ports = [int(x.strip()) for x in str(args.ports).split(",") if x.strip().isdigit()]
     args.per_host_limit = getattr(args, "per_host_limit", 2)
     args.per_host_interval = getattr(args, "per_host_interval", 1.0)
     args.global_limit = getattr(args, "global_limit", 50)
@@ -594,6 +738,7 @@ def main():
     except KeyboardInterrupt:
         LOG.warning("Interrupted")
         sys.exit(2)
+
 
 if __name__ == "__main__":
     main()
