@@ -1,7 +1,3 @@
----
-
-# File: `.github/workflows/enrich.yml`
-```yaml
 name: Enrich and Verify (Stop at target)
 
 on:
@@ -14,7 +10,15 @@ on:
       concurrency:
         description: 'HTTP concurrency for scraper'
         required: false
-        default: '80'
+        default: '40'
+      http_timeout:
+        description: 'HTTP page fetch timeout (seconds)'
+        required: false
+        default: '8'
+      mx_timeout:
+        description: 'MX DNS check timeout (seconds)'
+        required: false
+        default: '4'
 
 jobs:
   enrich:
@@ -31,7 +35,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
@@ -40,10 +44,25 @@ jobs:
         env:
           TARGET: ${{ github.event.inputs.target }}
           CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          HTTP_TIMEOUT: ${{ github.event.inputs.http_timeout }}
+          MX_TIMEOUT: ${{ github.event.inputs.mx_timeout }}
         run: |
-          python3 scripts/enrich.py --input filtered_companies.csv --output enriched_verified.csv --target ${TARGET} --concurrency ${CONCURRENCY} --http-timeout 8 --mx-timeout 4
+          echo "Running enrichment: target=$TARGET concurrency=$CONCURRENCY http_timeout=$HTTP_TIMEOUT mx_timeout=$MX_TIMEOUT"
+          python3 scripts/enrich.py \
+            --input filtered_companies.csv \
+            --output enriched_verified.csv \
+            --target "${TARGET}" \
+            --concurrency "${CONCURRENCY}" \
+            --http-timeout "${HTTP_TIMEOUT}" \
+            --mx-timeout "${MX_TIMEOUT}"
 
-      - name: Upload artifact
+      - name: Ensure output file exists (avoid upload failure)
+        run: |
+          if [ ! -f enriched_verified.csv ]; then
+            echo "NO_RESULTS" > enriched_verified.csv
+          fi
+
+      - name: Upload artifact (enriched_verified.csv)
         uses: actions/upload-artifact@v4
         with:
           name: enriched-verified
