@@ -272,4 +272,3 @@ def parse_args(): p = argparse.ArgumentParser(description="Async enricher: stop 
 def main(): args = parse_args() # configure logging logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s") try: res = asyncio.run(main_async(args)) sys.exit(res or 0) except Exception as e: LOG.exception("Fatal error") sys.exit(2)
 
 if name == "main": main()
-
