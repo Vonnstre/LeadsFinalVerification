@@ -18,8 +18,9 @@ Dependencies (put in requirements.txt):
 
 Usage:
   python3 enrich.py --input filtered_companies.csv --output enriched.csv --sample sample_top100.csv
+  For batching on GitHub runs:
+  python3 enrich.py --input filtered_companies.csv --batch-index 2 --batch-size 5000 --output enriched_batch2.csv
 """
-
 from __future__ import annotations
 
 import argparse
@@ -216,6 +217,8 @@ async def enrich(
     user_agent: str,
     keep_role: bool,
     disposable_file: Optional[Path],
+    batch_index: int,
+    batch_size: int,
 ):
     # load disposables
     disposable_set: Set[str] = set(COMMON_DISPOSABLE)
@@ -252,7 +255,24 @@ async def enrich(
             seen_rows.add(key)
             raw_rows.append({"company": company, "email": email, **row})
 
-    LOG.info("Loaded rows: %d (after exact dedupe)", len(raw_rows))
+    total_rows = len(raw_rows)
+    LOG.info("Loaded rows: %d (after exact dedupe)", total_rows)
+
+    # batching: compute slice for this run
+    if batch_index < 0:
+        batch_index = 0
+    if batch_size <= 0:
+        batch_size = total_rows
+    start = batch_index * batch_size
+    end = min(start + batch_size, total_rows)
+    if start >= total_rows:
+        LOG.info("Batch start (%d) >= total rows (%d). Nothing to do.", start, total_rows)
+        mx.shutdown()
+        return
+    # slice raw_rows in-place for processing only that batch
+    raw_rows = raw_rows[start:end]
+    LOG.info("Processing batch %d: rows %d..%d (count=%d) out of %d total rows",
+             batch_index, start, end - 1, len(raw_rows), total_rows)
 
     # caches & counters
     enriched_by_email: Dict[str, Dict] = {}
@@ -553,13 +573,17 @@ def parse_args():
     p.add_argument("--user-agent", default="Mozilla/5.0 (compatible; Enricher/1.0)", help="User-Agent for scraping")
     p.add_argument("--keep-role", action="store_true", help="If set, keep role addresses; otherwise drop")
     p.add_argument("--disposable-file", default=None, help="Optional path to extra disposable domains (one per line)")
+    # batching args
+    p.add_argument("--batch-index", type=int, default=0, help="0-based batch index to process")
+    p.add_argument("--batch-size", type=int, default=5000, help="number of rows per batch")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    LOG.info("Running enrichment: input=%s output=%s concurrency=%s http_timeout=%s mx_timeout=%s", args.input, args.output, args.concurrency, args.http_timeout, args.mx_timeout)
+    LOG.info("Running enrichment: input=%s output=%s concurrency=%s http_timeout=%s mx_timeout=%s batch_index=%s batch_size=%s",
+             args.input, args.output, args.concurrency, args.http_timeout, args.mx_timeout, args.batch_index, args.batch_size)
     input_path = Path(args.input)
     output_path = Path(args.output)
     sample_path = Path(args.sample)
@@ -583,6 +607,8 @@ def main():
                 user_agent=args.user_agent,
                 keep_role=args.keep_role,
                 disposable_file=disposable_path,
+                batch_index=args.batch_index,
+                batch_size=args.batch_size,
             )
         )
     except KeyboardInterrupt:
