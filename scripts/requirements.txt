@@ -1,4 +1,5 @@
-dnspython>=2.3.0
-aiohttp>=3.8.0
-beautifulsoup4>=4.12.0
-email-validator>=2.0.0
+aiohttp>=3.8
+dnspython>=2.3
+beautifulsoup4>=4.12
+email-validator>=1.3  # optional but recommended; script works without it
+lxml>=4.9  # optional (beautifulsoup can use it if installed)
