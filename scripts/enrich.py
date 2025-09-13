@@ -2,20 +2,9 @@
 """
 enrich.py — fast domain-level enrichment for B2B contact lists (no SMTP probing)
 
-Goal: produce a defensible 10k contactable B2B slice quickly:
- - Clean & dedupe
- - Syntax check (fast regex/email-validator)
- - Domain normalization (slug company -> possible domains)
- - MX check per domain (threadpooled dns.resolver, cached)
- - Async shallow scraping of contact pages to extract visible emails
- - Flag disposable & role addresses
- - Score records (0..100), dedupe keep best score
- - Output: enriched CSV + sample_top100.csv + printed stats
-
 Usage:
   python3 enrich.py --input companies.csv --output enriched.csv --target 10000
 """
-
 from __future__ import annotations
 import argparse
 import asyncio
@@ -23,8 +12,6 @@ import csv
 import logging
 import os
 import re
-import socket
-import string
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -43,7 +30,6 @@ except Exception:
     ev_validate = None
 
 LOG = logging.getLogger("enricher")
-
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
 TLD_CANDIDATES = [".com", ".co.uk", ".uk", ".net", ".io", ".co", ".biz", ".org"]
 CONTACT_PAGES = ["/", "/contact", "/contact-us", "/about", "/team"]
@@ -52,7 +38,6 @@ ROLE_LOCALPARTS = {
     "help", "billing", "webmaster", "noreply", "no-reply", "newsletter"
 }
 COMMON_DISPOSABLE = {"mailinator.com", "tempmail.com", "10minutemail.com", "yopmail.com", "dispostable.com"}
-
 HTML_HEURISTIC_BYTES = 512
 
 
@@ -98,16 +83,15 @@ def validate_syntax(email: str) -> Tuple[bool, Optional[str]]:
     try:
         if ev_validate:
             info = ev_validate(email, check_deliverability=False)
-            # email_validator returns an object; use the normalized address attribute safely
+            # email_validator returns an object with .email attribute (or dict fallback)
             norm = getattr(info, "email", None) or (info["email"] if isinstance(info, dict) and "email" in info else None)
-            return True, norm or email.strip()
+            return True, (norm or email.strip())
         m = EMAIL_RE.fullmatch(email.strip())
         return (m is not None, email.strip() if m else None)
     except Exception:
         return False, None
 
 
-# MX checker (threaded synchronous resolver)
 class MXCache:
     def __init__(self, mx_timeout: float = 6.0, threads: int = 8):
         self.mx_timeout = float(mx_timeout)
@@ -120,7 +104,6 @@ class MXCache:
             pairs = sorted([(r.preference, str(r.exchange).rstrip(".")) for r in ans], key=lambda x: x[0])
             return pairs
         except Exception:
-            # fallback to A
             try:
                 ans = dns.resolver.resolve(domain, "A", lifetime=self.mx_timeout)
                 return [(0, str(ans[0]))]
@@ -143,7 +126,6 @@ class MXCache:
             pass
 
 
-# Async shallow scraper to grab visible emails from a domain (contact pages)
 async def scrape_domain_for_emails(session: aiohttp.ClientSession, domain: str, http_timeout: float, user_agent: str) -> Set[str]:
     found: Set[str] = set()
     headers = {"User-Agent": user_agent, "Accept": "text/html,application/xhtml+xml"}
@@ -160,13 +142,11 @@ async def scrape_domain_for_emails(session: aiohttp.ClientSession, domain: str, 
                     if not _looks_like_html(txt):
                         continue
                     soup = BeautifulSoup(txt, "html.parser")
-                    # mailto anchors
                     for a in soup.select("a[href^=mailto]"):
                         href = a.get("href", "")
                         m = re.search(r"mailto:([^?]+)", href, re.I)
                         if m:
                             found.add(m.group(1).strip().lower())
-                    # visible emails
                     for e in EMAIL_RE.findall(soup.get_text(" ", strip=True)):
                         found.add(e.lower())
                     if found:
@@ -178,20 +158,16 @@ async def scrape_domain_for_emails(session: aiohttp.ClientSession, domain: str, 
     return found
 
 
-# Scoring formula (0..100)
 def score_record(source: str, mx_ok: bool, is_disposable: bool, is_role: bool, scraped: bool, company_present: bool) -> int:
     score = 0
-    # source: "given" (input), "scraped" (from site), "generated" (guessed)
     if source == "scraped":
         score += 60
     elif source == "given":
         score += 30
     elif source == "generated":
         score += 10
-    # MX presence is strong signal
     if mx_ok:
         score += 25
-    # scraped presence of the exact email is powerful
     if scraped:
         score += 15
     if company_present:
@@ -200,9 +176,7 @@ def score_record(source: str, mx_ok: bool, is_disposable: bool, is_role: bool, s
         score -= 50
     if is_role:
         score -= 30
-    # clamp
-    score = max(0, min(100, score))
-    return score
+    return max(0, min(100, score))
 
 
 async def enrich(
@@ -229,242 +203,259 @@ async def enrich(
         except Exception:
             LOG.warning("failed to load disposable file; continuing with builtin list")
 
-    mx = MXCache(mx_timeout=mx_timeout, threads=max(4, concurrency // 2))
-
-    # aiohttp session for scraping
+    mx = MXCache(mx_timeout=mx_timeout, threads=max(2, min(32, concurrency)))
     conn = aiohttp.TCPConnector(limit_per_host=max(2, concurrency // 4), limit=0)
     timeout = aiohttp.ClientTimeout(total=http_timeout)
-    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
-        # read input, clean & dedupe (by row-string or email/company combo)
-        seen_rows: Set[str] = set()
-        raw_rows: List[Dict[str, str]] = []
-        with input_path.open(newline="", encoding="utf-8", errors="replace") as inf:
-            reader = csv.DictReader(inf)
-            for row in reader:
-                # normalize minimal fields
-                company = (row.get("CompanyName") or row.get("company") or "").strip()
-                email = (row.get("email") or row.get("Email") or "").strip()
-                # skip empty rows
-                if not company and not email:
+
+    # read input, clean & dedupe
+    raw_rows: List[Dict[str, str]] = []
+    seen_rows: Set[str] = set()
+    with input_path.open(newline="", encoding="utf-8", errors="replace") as inf:
+        reader = csv.DictReader(inf)
+        for row in reader:
+            company = (row.get("CompanyName") or row.get("company") or "").strip()
+            email = (row.get("email") or row.get("Email") or "").strip()
+            if not company and not email:
+                continue
+            key = f"{company}||{email}"
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            raw_rows.append({"company": company, "email": email, **row})
+
+    LOG.info("Loaded rows: %d (after exact dedupe)", len(raw_rows))
+
+    enriched_by_email: Dict[str, Dict] = {}
+    lock = asyncio.Lock()
+    found_count = 0  # accepted records counting (non-disposable & role filter)
+    processed_rows = 0
+    scraped_found = 0
+
+    async def process_row(r: Dict[str, str]):
+        nonlocal found_count, processed_rows, scraped_found
+        company = r.get("company", "").strip()
+        in_email = (r.get("email") or "").strip()
+        candidate_emails: List[Tuple[str, str]] = []
+        company_present = bool(company)
+
+        # input email
+        if in_email:
+            ok, norm = validate_syntax(in_email)
+            if ok and norm:
+                candidate_emails.append((norm.lower(), "given"))
+
+        # if none, generate guesses
+        if not candidate_emails and company_present:
+            domains = gen_domains(company)
+            for d in domains:
+                for lp in ("info", "contact", "sales", "hello", "admin"):
+                    candidate_emails.append((f"{lp}@{d}", "generated"))
+
+        # build domains to check
+        domains_to_check: Set[str] = set()
+        for em, _src in candidate_emails:
+            if "@" in em:
+                domains_to_check.add(em.rsplit("@", 1)[-1].lower())
+        if company_present:
+            for d in gen_domains(company):
+                domains_to_check.add(d)
+
+        # MX checks
+        domain_mx_map: Dict[str, List[Tuple[int, str]]] = {}
+        for dom in list(domains_to_check):
+            try:
+                mx_pairs = await mx.get_mx(dom)
+            except Exception:
+                mx_pairs = []
+            domain_mx_map[dom] = mx_pairs
+            if mx_pairs:
+                # we don't increment global mx_ok_domains here for simplicity; it's computed later
+                pass
+
+        # Scrape domains in parallel (but the caller limits concurrency overall)
+        scraped_emails: Set[str] = set()
+        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+            scrape_tasks = []
+            for d in domain_mx_map.keys():
+                scrape_tasks.append(asyncio.create_task(scrape_domain_for_emails(session, d, http_timeout, user_agent)))
+            if scrape_tasks:
+                results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, set):
+                        for em in res:
+                            ok, norm = validate_syntax(em)
+                            if ok and norm:
+                                scraped_emails.add(norm.lower())
+                if scraped_emails:
+                    scraped_found += len(scraped_emails)
+
+        # assemble final candidates (scraped first)
+        final_candidates: List[Tuple[str, str, bool]] = []
+        for se in sorted(scraped_emails):
+            final_candidates.append((se, "scraped", True))
+        for em, src in candidate_emails:
+            if em.lower() in scraped_emails:
+                continue
+            final_candidates.append((em.lower(), src, False))
+
+        # evaluate and upsert into enriched_by_email
+        async with lock:
+            for email, source, scraped_flag in final_candidates:
+                if "@" not in email:
                     continue
-                key = f"{company}||{email}"
-                if key in seen_rows:
-                    continue
-                seen_rows.add(key)
-                raw_rows.append({"company": company, "email": email, **row})
+                local, domain = email.rsplit("@", 1)
+                domain = domain.lower()
+                is_role = local.lower() in ROLE_LOCALPARTS
+                is_disposable = domain in disposable_set
+                mx_pairs = domain_mx_map.get(domain) or []
+                mx_ok = bool(mx_pairs)
+                sc = score_record(source, mx_ok, is_disposable, is_role, bool(scraped_flag), company_present)
+                rec = {
+                    "company": company,
+                    "input_email": in_email,
+                    "email": email,
+                    "source": source,
+                    "scraped": bool(scraped_flag),
+                    "mx_ok": mx_ok,
+                    "is_disposable": is_disposable,
+                    "is_role": is_role,
+                    "score": sc,
+                    "checked_at": datetime.utcnow().isoformat() + "Z",
+                }
+                prev = enriched_by_email.get(email)
+                # deciding acceptance for early target enforcement:
+                def accepted(rdict):
+                    if rdict is None:
+                        return False
+                    if rdict.get("is_disposable"):
+                        return False
+                    if rdict.get("is_role") and not keep_role:
+                        return False
+                    return (rdict.get("score", 0) > 0)
 
-        LOG.info("Loaded rows: %d (after exact dedupe)", len(raw_rows))
+                prev_accepted = accepted(prev)
+                new_accepted = accepted(rec)
+                if prev is None:
+                    enriched_by_email[email] = rec
+                    if new_accepted:
+                        found_count += 1
+                else:
+                    # replace if better
+                    if rec["score"] > prev["score"]:
+                        enriched_by_email[email] = rec
+                        if prev_accepted and not new_accepted:
+                            found_count -= 1
+                        elif not prev_accepted and new_accepted:
+                            found_count += 1
+                    elif rec["score"] == prev["score"]:
+                        prio = {"scraped": 3, "given": 2, "generated": 1}
+                        if prio.get(rec["source"], 0) > prio.get(prev.get("source", ""), 0):
+                            enriched_by_email[email] = rec
+                            if prev_accepted and not new_accepted:
+                                found_count -= 1
+                            elif not prev_accepted and new_accepted:
+                                found_count += 1
+            processed_rows += 1
 
-        # asynchronous worker pipeline (bounded concurrency)
-        sem = asyncio.Semaphore(concurrency)
+    # dispatch tasks in a bounded way and heartbeat
+    active: Set[asyncio.Task] = set()
+    stop_event = asyncio.Event()
 
-        enriched_by_email: Dict[str, Dict] = {}  # dedupe by email, keep best score
-        stats = {
-            "total_input": len(raw_rows),
-            "with_email": 0,
-            "scraped_found": 0,
-            "mx_ok_domains": 0,
-            "disposable_count": 0,
-            "role_count": 0,
-        }
+    async def heartbeat(interval: float = 15.0):
+        while not stop_event.is_set():
+            async with lock:
+                LOG.info("HEARTBEAT: processed=%d active=%d candidates=%d accepted=%d scraped_total=%d mx_cache=%d",
+                         processed_rows, len(active), len(enriched_by_email), found_count, scraped_found, len(mx._cache))
+            await asyncio.sleep(interval)
 
-        async def process_row(r: Dict[str, str]):
-            async with sem:
-                company = r.get("company", "").strip()
-                in_email = (r.get("email") or "").strip()
-                candidate_emails: List[Tuple[str, str]] = []  # (email, source)
-                company_present = bool(company)
+    hb = asyncio.create_task(heartbeat())
 
-                # if input email present -> syntax-filter it
-                if in_email:
-                    ok, norm = validate_syntax(in_email)
-                    if ok and norm:
-                        candidate_emails.append((norm.lower(), "given"))
-                        stats["with_email"] += 1
-                    else:
-                        # drop invalid email: still allow domain guessing later
-                        pass
+    # dispatch loop (streaming)
+    try:
+        for i, row in enumerate(raw_rows):
+            if target and found_count >= int(target):
+                LOG.info("Target reached in dispatch loop: %d records accepted; stopping dispatch.", found_count)
+                break
+            # keep number of active tasks bounded
+            while len(active) >= max(1, concurrency * 2):
+                # if target reached while waiting, break
+                if target and found_count >= int(target):
+                    break
+                await asyncio.sleep(0.05)
+            if target and found_count >= int(target):
+                break
+            task = asyncio.create_task(process_row(row))
+            active.add(task)
+            # make sure to remove from active when done
+            task.add_done_callback(lambda t, s=active: s.discard(t))
 
-                # if no email, generate guessed locals on guessed domain(s) and later attempt scraping to find better
-                if not candidate_emails and company_present:
-                    domains = gen_domains(company)
-                    # create generated localparts to attempt extraction later
-                    for d in domains:
-                        for lp in ("info", "contact", "sales", "hello", "admin"):
-                            candidate_emails.append((f"{lp}@{d}", "generated"))
-                # Also, if email present, also consider scraping the domain for a better on-page email.
-                # We'll compute domain set to check MX + scrape.
-                domains_to_check: Set[str] = set()
-                for em, _src in candidate_emails:
-                    if "@" in em:
-                        domains_to_check.add(em.rsplit("@", 1)[-1].lower())
-
-                # Also include slugged candidate domains from company
-                if company_present:
-                    for d in gen_domains(company):
-                        domains_to_check.add(d)
-
-                # For each domain: MX check (cached) and shallow scrape (stop early if we already got scraped email)
-                domain_mx_map: Dict[str, List[Tuple[int, str]]] = {}
-                for dom in list(domains_to_check):
-                    mx_pairs = await mx.get_mx(dom)
-                    domain_mx_map[dom] = mx_pairs
-                    if mx_pairs:
-                        stats["mx_ok_domains"] += 1
-
-                # Scrape domains asynchronously (parallel but limited by session)
-                scraped_emails: Set[str] = set()
-                # launch scrapes concurrently but limited
-                async def _scrape_dom(dom: str):
+        # wait for remaining tasks to complete, but if target reached cancel remaining tasks
+        while active:
+            if target and found_count >= int(target):
+                LOG.info("Target reached: cancelling %d active tasks", len(active))
+                for t in list(active):
                     try:
-                        found = await scrape_domain_for_emails(session, dom, http_timeout, user_agent)
-                        return found
+                        t.cancel()
                     except Exception:
-                        return set()
+                        pass
+                break
+            await asyncio.sleep(0.1)
+            # let done callbacks remove finished tasks
+    finally:
+        stop_event.set()
+        hb.cancel()
+        # gather to ensure exceptions are surfaced (but ignore cancel exceptions)
+        if active:
+            await asyncio.gather(*list(active), return_exceptions=True)
 
-                # spawn scrapes for all domains (in parallel, but function itself uses session)
-                scrape_tasks = [asyncio.create_task(_scrape_dom(d)) for d in domain_mx_map.keys()]
-                if scrape_tasks:
-                    results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
-                    for res in results:
-                        if isinstance(res, set):
-                            for em in res:
-                                ok, norm = validate_syntax(em)
-                                if ok and norm:
-                                    scraped_emails.add(norm.lower())
-                    if scraped_emails:
-                        stats["scraped_found"] += len(scraped_emails)
+    # finalize list
+    final_list: List[Dict] = []
+    for em, rec in enriched_by_email.items():
+        if rec["is_disposable"]:
+            continue
+        if rec["is_role"] and not keep_role:
+            continue
+        final_list.append(rec)
 
-                # Now assemble candidate set: priority to scraped exact addresses
-                final_candidates: List[Tuple[str, str, bool]] = []  # (email, source, scraped_flag)
-                # scraped ones first
-                for se in sorted(scraped_emails):
-                    final_candidates.append((se, "scraped", True))
-                # then original/generation
-                for em, src in candidate_emails:
-                    # don't duplicate
-                    if em.lower() in scraped_emails:
-                        continue
-                    final_candidates.append((em.lower(), src, False))
+    final_list.sort(key=lambda x: (-x["score"], not x["scraped"], not x["mx_ok"]))
 
-                # evaluate each candidate: domain-level mx_ok, is_disposable, is_role, score
-                for email, source, scraped_flag in final_candidates:
-                    if "@" not in email:
-                        continue
-                    local, domain = email.rsplit("@", 1)
-                    domain = domain.lower()
-                    is_role = local.lower() in ROLE_LOCALPARTS
-                    is_disposable = domain in disposable_set
-                    if is_disposable:
-                        stats["disposable_count"] += 1
-                    if is_role:
-                        stats["role_count"] += 1
-                    mx_pairs = domain_mx_map.get(domain) or []
-                    mx_ok = bool(mx_pairs)
-                    # If domain has no MX and no A, consider low score and skip if generated
-                    scraped_flag_bool = bool(scraped_flag)
-                    sc = score_record(source, mx_ok, is_disposable, is_role, scraped_flag_bool, company_present)
-                    # if role addresses and keep_role is False, mark but still keep (we'll filter later)
-                    record = {
-                        "company": company,
-                        "input_email": in_email,
-                        "email": email,
-                        "source": source,
-                        "scraped": scraped_flag_bool,
-                        "mx_ok": mx_ok,
-                        "is_disposable": is_disposable,
-                        "is_role": is_role,
-                        "score": sc,
-                        "checked_at": datetime.utcnow().isoformat() + "Z",
-                    }
-                    # dedupe by email: keep highest score (tie-breaker: scraped > given > generated)
-                    prev = enriched_by_email.get(email)
-                    if prev is None:
-                        enriched_by_email[email] = record
-                    else:
-                        # compare
-                        if record["score"] > prev["score"]:
-                            enriched_by_email[email] = record
-                        elif record["score"] == prev["score"]:
-                            # prefer scraped
-                            prio = {"scraped": 3, "given": 2, "generated": 1}
-                            if prio.get(record["source"], 0) > prio.get(prev.get("source", ""), 0):
-                                enriched_by_email[email] = record
+    if target:
+        final_list = final_list[: int(target)]
 
-        # schedule all/process in limited concurrency
-        tasks = [asyncio.create_task(process_row(r)) for r in raw_rows]
-        # wait in batches to avoid exploding memory when huge lists
-        BATCH = max(1000, concurrency * 50)
-        for i in range(0, len(tasks), BATCH):
-            batch = tasks[i : i + BATCH]
-            await asyncio.gather(*batch)
-
-        # finalize: filter out role/disposable if requested
-        final_list = []
-        for em, rec in enriched_by_email.items():
-            if (rec["is_disposable"]) or (rec["is_role"] and not keep_role):
-                # keep but mark (we'll drop disposables by default)
-                if rec["is_disposable"]:
-                    continue
-                if rec["is_role"] and not keep_role:
-                    continue
-            final_list.append(rec)
-
-        # sort by score desc
-        final_list.sort(key=lambda x: (-x["score"], not x["scraped"], not x["mx_ok"]))
-
-        # trim to target if provided
-        if target:
-            final_list = final_list[: int(target)]
-
-        # write enriched CSV
-        out_fieldnames = [
-            "company",
-            "input_email",
-            "email",
-            "source",
-            "scraped",
-            "mx_ok",
-            "is_disposable",
-            "is_role",
-            "score",
-            "checked_at",
-        ]
-        with output_path.open("w", newline="", encoding="utf-8") as outf:
-            writer = csv.DictWriter(outf, fieldnames=out_fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for r in final_list:
-                writer.writerow(r)
-
-        # write sample top 100
-        sample = final_list[:100]
-        with sample_path.open("w", newline="", encoding="utf-8") as sf:
-            swriter = csv.DictWriter(sf, fieldnames=out_fieldnames, extrasaction="ignore")
-            swriter.writeheader()
-            for r in sample:
-                swriter.writerow(r)
-
-        # print stats summary
-        total_out = len(final_list)
-        LOG.info("Enrichment finished: output rows=%d (target=%s)", total_out, str(target))
-        LOG.info("Input rows: %d | with input email: %d | scraped found emails: %d", stats["total_input"], stats["with_email"], stats["scraped_found"])
-        LOG.info("MX-passing domains seen (counted per domain check): %d", stats["mx_ok_domains"])
-        LOG.info("Discarded disposable addresses: %d | role addresses encountered: %d", stats["disposable_count"], stats["role_count"])
-        # also show score distribution
-        bins = {"90+": 0, "70-89": 0, "40-69": 0, "0-39": 0}
+    out_fieldnames = [
+        "company", "input_email", "email", "source", "scraped", "mx_ok", "is_disposable", "is_role", "score", "checked_at"
+    ]
+    with output_path.open("w", newline="", encoding="utf-8") as outf:
+        writer = csv.DictWriter(outf, fieldnames=out_fieldnames, extrasaction="ignore")
+        writer.writeheader()
         for r in final_list:
-            sc = r["score"]
-            if sc >= 90:
-                bins["90+"] += 1
-            elif sc >= 70:
-                bins["70-89"] += 1
-            elif sc >= 40:
-                bins["40-69"] += 1
-            else:
-                bins["0-39"] += 1
-        LOG.info("Score bins: %s", bins)
+            writer.writerow(r)
 
-        mx.shutdown()
+    sample = final_list[:100]
+    with sample_path.open("w", newline="", encoding="utf-8") as sf:
+        swriter = csv.DictWriter(sf, fieldnames=out_fieldnames, extrasaction="ignore")
+        swriter.writeheader()
+        for r in sample:
+            swriter.writerow(r)
+
+    # summary
+    LOG.info("Enrichment finished: output_rows=%d target=%s processed=%d candidates=%d accepted=%d mx_cache=%d",
+             len(final_list), str(target), processed_rows, len(enriched_by_email), found_count, len(mx._cache))
+
+    # bins
+    bins = {"90+": 0, "70-89": 0, "40-69": 0, "0-39": 0}
+    for r in final_list:
+        sc = r["score"]
+        if sc >= 90:
+            bins["90+"] += 1
+        elif sc >= 70:
+            bins["70-89"] += 1
+        elif sc >= 40:
+            bins["40-69"] += 1
+        else:
+            bins["0-39"] += 1
+    LOG.info("Score bins: %s", bins)
+    mx.shutdown()
 
 
 def parse_args():
