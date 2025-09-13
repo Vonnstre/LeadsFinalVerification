@@ -14,7 +14,7 @@ on:
       concurrency:
         description: 'HTTP concurrency for scraper'
         required: false
-        default: '40'
+        default: '60'
       http_timeout:
         description: 'HTTP page fetch timeout (seconds)'
         required: false
@@ -24,13 +24,13 @@ on:
         required: false
         default: '4'
       batch_size:
-        description: 'Rows per batch (default: 5000)'
+        description: 'Rows per batch (default: 10000)'
         required: false
-        default: '5000'
+        default: '10000'
       max_parallel:
         description: 'Max parallel batch jobs to run at once'
         required: false
-        default: '4'
+        default: '10'
 
 jobs:
   prepare:
@@ -58,15 +58,14 @@ jobs:
           set -euo pipefail
 
           path="${INPUT_PATH:-filtered_companies.csv}"
-          bs="${BATCH_SIZE:-5000}"
+          bs="${BATCH_SIZE:-10000}"
 
           # normalize bs to integer fallback
           if ! bs=$(printf "%d" "$bs" 2>/dev/null); then
-            bs=5000
+            bs=10000
           fi
 
           if [ -f "$path" ]; then
-            # count lines (works for CRLF too)
             total_lines=$(awk 'END{print NR}' "$path" 2>/dev/null || echo 0)
             total=$(( total_lines - 1 ))
             if [ "$total" -lt 0 ]; then
@@ -114,7 +113,8 @@ jobs:
     strategy:
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.matrix) }}
-      max-parallel: ${{ github.event.inputs.max_parallel }}
+      # coerce the string input into a JSON number (integer) to satisfy GitHub
+      max-parallel: ${{ fromJson(github.event.inputs.max_parallel || '10') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -144,7 +144,6 @@ jobs:
         run: |
           echo "Batch ${BATCH_INDEX} of ${BATCH_COUNT}: processing up to ${BATCH_SIZE} rows from ${INPUT}"
 
-          # If multiple batches, skip per-batch --target to avoid races/overshoot
           if [ -n "${BATCH_COUNT}" ] && [ "${BATCH_COUNT}" -gt "1" ]; then
             TARGET_ARG=""
             echo "Multiple batches detected; skipping per-batch --target."
@@ -235,7 +234,6 @@ jobs:
           if [ ! -f "$SAMP" ]; then
             echo "company,input_email,email,source,scraped,mx_ok,is_disposable,is_role,score,checked_at" > "$SAMP"
           fi
-          # keep only unique emails in the merged sample (by email column)
           awk -F, 'NR==1{print; next} !seen[$3]++' "$SAMP" > "${SAMP}.uniq" || true
           mv "${SAMP}.uniq" "$SAMP"
 
