@@ -8,7 +8,7 @@ on:
         required: false
         default: 'filtered_companies.csv'
       target:
-        description: 'Number of verified emails to stop at (ignored when batching >1)'
+        description: 'Number of verified emails to stop at (only used if single batch)'
         required: false
         default: '100000'
       concurrency:
@@ -33,7 +33,6 @@ on:
         default: '4'
 
 jobs:
-  # 1) PREPARE: count rows and generate a matrix of batch_index values
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -45,7 +44,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python (for small helper)
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -56,36 +55,62 @@ jobs:
           INPUT_PATH: ${{ github.event.inputs.input }}
           BATCH_SIZE: ${{ github.event.inputs.batch_size }}
         run: |
-          python - <<'PY' > /tmp/matrix.json
-import json, os, sys
-path = os.environ.get("INPUT_PATH","filtered_companies.csv")
-bs = int(os.environ.get("BATCH_SIZE","5000") or 5000)
-try:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        total = sum(1 for _ in f) - 1  # subtract header
-        if total < 0:
-            total = 0
-except FileNotFoundError:
-    print(json.dumps({"matrix": [], "batch_count": 0}))
-    sys.exit(0)
-batch_count = (total + bs - 1) // bs if total > 0 else 0
-matrix = [{"batch_index": i} for i in range(batch_count)]
-print(json.dumps({"matrix": matrix, "batch_count": batch_count}))
-PY
+          set -euo pipefail
+
+          path="${INPUT_PATH:-filtered_companies.csv}"
+          bs="${BATCH_SIZE:-5000}"
+          # ensure bs is integer
+          bs=$(printf "%d" "$bs" 2>/dev/null || echo 5000)
+
+          if [ -f "$path" ]; then
+            # count lines robustly (handles CRLF)
+            total_lines=$(awk 'END{print NR}' "$path" 2>/dev/null || echo 0)
+            total=$(( total_lines - 1 ))
+            if [ "$total" -lt 0 ]; then
+              total=0
+            fi
+          else
+            total=0
+          fi
+
+          if [ "$total" -gt 0 ]; then
+            batch_count=$(( (total + bs - 1) / bs ))
+          else
+            batch_count=0
+          fi
+
+          # build JSON matrix [{"batch_index":0}, {"batch_index":1}, ...]
+          if [ "$batch_count" -gt 0 ]; then
+            matrix='['
+            i=0
+            while [ "$i" -lt "$batch_count" ]; do
+              matrix="${matrix}{\"batch_index\": ${i}}"
+              i=$((i+1))
+              if [ "$i" -lt "$batch_count" ]; then
+                matrix="${matrix},"
+              fi
+            done
+            matrix="${matrix}]"
+          else
+            matrix='[]'
+          fi
+
+          printf '{"matrix": %s, "batch_count": %s}\n' "$matrix" "$batch_count" > /tmp/matrix.json
+
           CAT=$(cat /tmp/matrix.json)
-          MATRIX=$(echo "$CAT" | python -c 'import sys, json; o=json.load(sys.stdin); print(json.dumps(o["matrix"]))')
-          COUNT=$(echo "$CAT" | python -c 'import sys, json; o=json.load(sys.stdin); print(o["batch_count"])')
+          MATRIX=$(echo "$CAT" | python -c 'import sys,json; o=json.load(sys.stdin); print(json.dumps(o["matrix"]))')
+          COUNT=$(echo "$CAT" | python -c 'import sys,json; o=json.load(sys.stdin); print(o["batch_count"])')
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           echo "batch_count=$COUNT" >> $GITHUB_OUTPUT
 
-  # 2) ENRICH (matrix): run one job per batch_index; each job runs enrich.py on its slice
   enrich:
     needs: prepare
+    # skip this job entirely if there are no batches (batch_count == 0)
+    if: ${{ needs.prepare.outputs.batch_count != '0' }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     strategy:
-      matrix:
-        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
       max-parallel: ${{ github.event.inputs.max_parallel }}
     steps:
       - name: Checkout repo
@@ -115,10 +140,11 @@ PY
           BATCH_COUNT: ${{ needs.prepare.outputs.batch_count }}
         run: |
           echo "Batch ${BATCH_INDEX} of ${BATCH_COUNT}: processing up to ${BATCH_SIZE} rows from ${INPUT}"
-          # If we are running >1 batch, avoid per-batch --target to prevent race/overshoot.
+
+          # If multiple batches, skip per-batch --target to avoid races/overshoot
           if [ -n "${BATCH_COUNT}" ] && [ "${BATCH_COUNT}" -gt "1" ]; then
             TARGET_ARG=""
-            echo "Multiple batches detected; skipping per-batch --target to let batches produce full slices."
+            echo "Multiple batches detected; skipping per-batch --target."
           else
             TARGET_ARG="--target ${TARGET}"
             echo "Single batch run: passing --target ${TARGET}"
@@ -157,9 +183,8 @@ PY
           name: sample-top100-${{ matrix.batch_index }}
           path: sample_top100_batch${{ matrix.batch_index }}.csv
 
-  # 3) MERGE: after all batch jobs finish, download artifacts and merge into one CSV
   merge:
-    needs: enrich
+    needs: [prepare, enrich]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -173,7 +198,6 @@ PY
           OUT_MERGED=merged/enriched_verified_merged.csv
           FIRST=1
           found_any=0
-          # artifacts/* directories contain the uploaded files per batch
           for f in artifacts/*/enriched_verified_batch*.csv; do
             if [ -f "$f" ]; then
               found_any=1
@@ -208,11 +232,11 @@ PY
           if [ ! -f "$SAMP" ]; then
             echo "company,input_email,email,source,scraped,mx_ok,is_disposable,is_role,score,checked_at" > "$SAMP"
           fi
-          # optional: keep only unique emails in the merged sample (by email)
+          # keep only unique emails in the merged sample (by email column)
           awk -F, 'NR==1{print; next} !seen[$3]++' "$SAMP" > "${SAMP}.uniq" || true
           mv "${SAMP}.uniq" "$SAMP"
 
-      - name: Upload merged artifacts
+      - name: Upload merged enriched CSV
         uses: actions/upload-artifact@v4
         with:
           name: enriched-verified-merged
