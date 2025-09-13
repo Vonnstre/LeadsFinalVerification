@@ -59,11 +59,14 @@ jobs:
 
           path="${INPUT_PATH:-filtered_companies.csv}"
           bs="${BATCH_SIZE:-5000}"
-          # ensure bs is integer
-          bs=$(printf "%d" "$bs" 2>/dev/null || echo 5000)
+
+          # normalize bs to integer fallback
+          if ! bs=$(printf "%d" "$bs" 2>/dev/null); then
+            bs=5000
+          fi
 
           if [ -f "$path" ]; then
-            # count lines robustly (handles CRLF)
+            # count lines (works for CRLF too)
             total_lines=$(awk 'END{print NR}' "$path" 2>/dev/null || echo 0)
             total=$(( total_lines - 1 ))
             if [ "$total" -lt 0 ]; then
@@ -79,7 +82,7 @@ jobs:
             batch_count=0
           fi
 
-          # build JSON matrix [{"batch_index":0}, {"batch_index":1}, ...]
+          # build JSON matrix (array of {"batch_index": N})
           if [ "$batch_count" -gt 0 ]; then
             matrix='['
             i=0
@@ -105,12 +108,12 @@ jobs:
 
   enrich:
     needs: prepare
-    # skip this job entirely if there are no batches (batch_count == 0)
     if: ${{ needs.prepare.outputs.batch_count != '0' }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     strategy:
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
       max-parallel: ${{ github.event.inputs.max_parallel }}
     steps:
       - name: Checkout repo
