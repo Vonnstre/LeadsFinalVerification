@@ -1,5 +1,7 @@
 aiohttp>=3.8
 dnspython>=2.3
 beautifulsoup4>=4.12
-email-validator>=1.3  # optional but recommended; script works without it
-lxml>=4.9  # optional (beautifulsoup can use it if installed)
+# Recommended for significantly faster HTML parsing in BeautifulSoup:
+lxml>=4.9 
+# Note: SMTP verification uses the built-in Python 'smtplib' library, 
+# so no external dependency is strictly needed for that feature.
