@@ -5,7 +5,7 @@ enrich.py — async domain-level enricher with SMTP verification
 Quick summary
 -------------
 - Reads a CSV (default: high_confidence_pi_mt_firms.csv)
-- Performs SMTP-level mail server checks (true mailbox validation).
+- Performs SMTPS-level mail server checks (true mailbox validation) on Port 465.
 - Scrapes a small set of contact pages once per domain (cached).
 - Generates intelligent attorney-name-based email guesses from the business name.
 - Outputs enriched.csv and a sample_top100.csv.
@@ -14,7 +14,7 @@ Dependencies (put in requirements.txt):
   aiohttp
   dnspython
   beautifulsoup4
-  (Optional but highly recommended: lxml for faster scraping)
+  lxml
 
 Usage:
   python3 enrich.py --input high_confidence_pi_mt_firms.csv --output enriched.csv
@@ -37,6 +37,7 @@ import aiohttp
 import dns.resolver
 import dns.exception
 import smtplib
+from smtplib import SMTP_SSL # Import SMTP_SSL for Port 465
 from bs4 import BeautifulSoup
 
 # ---------------------- configuration ----------------------
@@ -192,7 +193,7 @@ class DomainResolver:
             return []
 
     def _resolve_smtp_sync(self, email: str, mx_pairs: List[Tuple[int, str]]) -> bool:
-        """Performs a synchronous SMTP handshake to verify the mailbox."""
+        """Performs a synchronous SMTPS handshake to verify the mailbox using Port 465."""
         if not mx_pairs:
             return False
             
@@ -201,12 +202,11 @@ class DomainResolver:
         # Try all MX servers in order of preference
         for _pref, mx_server in mx_pairs:
             try:
-                # Use smtplib.SMTP for the sync operation in the thread pool
-                with smtplib.SMTP(mx_server, 25, timeout=self.timeout) as server:
+                # FIX: Use smtplib.SMTP_SSL for secure SMTPS on Port 465
+                with SMTP_SSL(mx_server, 465, timeout=self.timeout) as server: 
                     server.local_hostname = domain # Identify as a local host for the domain
                     server.ehlo()
-                    # Some servers require TLS, but we keep it simple for a free solution
-                    # server.starttls()
+                    
                     server.mail(DEFAULT_SENDER_EMAIL)
                     
                     # The VRFY command is often disabled; RCPT TO is the reliable method
@@ -219,10 +219,10 @@ class DomainResolver:
                         return True
                     
             except smtplib.SMTPConnectError:
-                # MX server did not connect/accept connections on port 25
+                # MX server did not connect/accept connections on port 465 (or SSL error)
                 continue
             except Exception:
-                # Other errors (timeout, etc.)
+                # Other errors (timeout, SSL/TLS handshake error, etc.)
                 continue
                 
         return False # Failed all MX servers
