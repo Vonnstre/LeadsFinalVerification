@@ -100,7 +100,8 @@ def gen_attorney_emails(business_name: str, domains: List[str]) -> List[Tuple[st
     """Intelligently generates name-based email candidates."""
     name_str = business_name
     # 1. Clean up legal suffixes
-    name_str = re.sub(FIRM_SUFFIXES, '', name_str, flags=re.I).strip()
+    # FIX: Removed the redundant 'flags=re.I' argument since FIRM_SUFFIXES is already compiled with it.
+    name_str = re.sub(FIRM_SUFFIXES, '', name_str).strip()
     # 2. Keep only potential names/words before any "Law" or "Group" terms
     name_str = re.sub(r"^(.*?)(LAW|GROUP|ASSOCIATES|PC)", r"\1", name_str, flags=re.I).strip()
     # 3. Clean up separators and extra words
