@@ -1,120 +1,33 @@
-name: Enrich and Verify (Batchable)
+name: Enrich and Verify (Single Run)
 
 on:
   workflow_dispatch:
     inputs:
       input:
-        description: 'Path to input CSV in repo (default: filtered_companies.csv)'
+        description: 'Path to input CSV (default: high_confidence_pi_mt_firms.csv)'
         required: false
-        default: 'filtered_companies.csv'
+        default: 'high_confidence_pi_mt_firms.csv'
       target:
-        description: 'Number of verified emails to stop at (only used if single batch)'
+        description: 'Number of verified emails to stop at (optional)'
         required: false
-        default: '100000'
+        default: ''
       concurrency:
-        description: 'HTTP concurrency for scraper'
+        description: 'Total async concurrency (HTTP scrapes + DNS/SMTP checks)'
         required: false
-        default: '60'
+        default: '50'
       http_timeout:
         description: 'HTTP page fetch timeout (seconds)'
         required: false
-        default: '8'
+        default: '6'
       mx_timeout:
-        description: 'MX DNS check timeout (seconds)'
+        description: 'DNS MX/SMTP check timeout (seconds)'
         required: false
-        default: '4'
-      batch_size:
-        description: 'Rows per batch (default: 10000)'
-        required: false
-        default: '10000'
-      max_parallel:
-        description: 'Max parallel batch jobs to run at once'
-        required: false
-        default: '10'
+        default: '3'
 
 jobs:
-  prepare:
+  enrich_single:
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      batch_count: ${{ steps.set-matrix.outputs.batch_count }}
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Compute batch matrix from input CSV
-        id: set-matrix
-        env:
-          INPUT_PATH: ${{ github.event.inputs.input }}
-          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
-        run: |
-          set -euo pipefail
-
-          path="${INPUT_PATH:-filtered_companies.csv}"
-          bs="${BATCH_SIZE:-10000}"
-
-          # normalize bs to integer fallback
-          if ! bs=$(printf "%d" "$bs" 2>/dev/null); then
-            bs=10000
-          fi
-
-          if [ -f "$path" ]; then
-            total_lines=$(awk 'END{print NR}' "$path" 2>/dev/null || echo 0)
-            total=$(( total_lines - 1 ))
-            if [ "$total" -lt 0 ]; then
-              total=0
-            fi
-          else
-            total=0
-          fi
-
-          if [ "$total" -gt 0 ]; then
-            batch_count=$(( (total + bs - 1) / bs ))
-          else
-            batch_count=0
-          fi
-
-          # build JSON matrix (array of {"batch_index": N})
-          if [ "$batch_count" -gt 0 ]; then
-            matrix='['
-            i=0
-            while [ "$i" -lt "$batch_count" ]; do
-              matrix="${matrix}{\"batch_index\": ${i}}"
-              i=$((i+1))
-              if [ "$i" -lt "$batch_count" ]; then
-                matrix="${matrix},"
-              fi
-            done
-            matrix="${matrix}]"
-          else
-            matrix='[]'
-          fi
-
-          printf '{"matrix": %s, "batch_count": %s}\n' "$matrix" "$batch_count" > /tmp/matrix.json
-
-          CAT=$(cat /tmp/matrix.json)
-          MATRIX=$(echo "$CAT" | python -c 'import sys,json; o=json.load(sys.stdin); print(json.dumps(o["matrix"]))')
-          COUNT=$(echo "$CAT" | python -c 'import sys,json; o=json.load(sys.stdin); print(o["batch_count"])')
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "batch_count=$COUNT" >> $GITHUB_OUTPUT
-
-  enrich:
-    needs: prepare
-    if: ${{ needs.prepare.outputs.batch_count != '0' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    strategy:
-      matrix:
-        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
-      # coerce the string input into a JSON number (integer) to satisfy GitHub
-      max-parallel: ${{ fromJson(github.event.inputs.max_parallel || '10') }}
+    timeout-minutes: 60
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -129,122 +42,39 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r scripts/requirements.txt
+          # Use lxml for speed if it's in your requirements.txt
+          pip install -r requirements.txt
 
-      - name: Run enrichment for batch
+      - name: Run full enrichment
         env:
           INPUT: ${{ github.event.inputs.input }}
           TARGET: ${{ github.event.inputs.target }}
           CONCURRENCY: ${{ github.event.inputs.concurrency }}
           HTTP_TIMEOUT: ${{ github.event.inputs.http_timeout }}
           MX_TIMEOUT: ${{ github.event.inputs.mx_timeout }}
-          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
-          BATCH_INDEX: ${{ matrix.batch_index }}
-          BATCH_COUNT: ${{ needs.prepare.outputs.batch_count }}
         run: |
-          echo "Batch ${BATCH_INDEX} of ${BATCH_COUNT}: processing up to ${BATCH_SIZE} rows from ${INPUT}"
-
-          if [ -n "${BATCH_COUNT}" ] && [ "${BATCH_COUNT}" -gt "1" ]; then
-            TARGET_ARG=""
-            echo "Multiple batches detected; skipping per-batch --target."
-          else
+          TARGET_ARG=""
+          if [ -n "${TARGET}" ]; then
             TARGET_ARG="--target ${TARGET}"
-            echo "Single batch run: passing --target ${TARGET}"
           fi
 
-          OUT="enriched_verified_batch${BATCH_INDEX}.csv"
-          SAMPLE="sample_top100_batch${BATCH_INDEX}.csv"
-
-          python3 scripts/enrich.py \
+          python3 enrich.py \
             --input "${INPUT}" \
-            --output "${OUT}" \
-            --sample "${SAMPLE}" \
+            --output "enriched_verified_final.csv" \
+            --sample "sample_top100_final.csv" \
             $TARGET_ARG \
             --concurrency "${CONCURRENCY}" \
             --http-timeout "${HTTP_TIMEOUT}" \
-            --mx-timeout "${MX_TIMEOUT}" \
-            --batch-index "${BATCH_INDEX}" \
-            --batch-size "${BATCH_SIZE}"
+            --mx-timeout "${MX_TIMEOUT}"
 
-      - name: Ensure output file exists (avoid upload failure)
-        run: |
-          OUT="enriched_verified_batch${{ matrix.batch_index }}.csv"
-          if [ ! -f "$OUT" ]; then
-            echo "NO_RESULTS" > "$OUT"
-          fi
-
-      - name: Upload artifact (per-batch)
+      - name: Upload enriched CSV
         uses: actions/upload-artifact@v4
         with:
-          name: enriched-verified-${{ matrix.batch_index }}
-          path: enriched_verified_batch${{ matrix.batch_index }}.csv
+          name: enriched-verified-final
+          path: enriched_verified_final.csv
 
-      - name: Upload sample artifact (per-batch)
+      - name: Upload sample artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sample-top100-${{ matrix.batch_index }}
-          path: sample_top100_batch${{ matrix.batch_index }}.csv
-
-  merge:
-    needs: [prepare, enrich]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Merge enriched batch CSVs into one file
-        run: |
-          mkdir -p merged
-          OUT_MERGED=merged/enriched_verified_merged.csv
-          FIRST=1
-          found_any=0
-          for f in artifacts/*/enriched_verified_batch*.csv; do
-            if [ -f "$f" ]; then
-              found_any=1
-              if [ "$FIRST" -eq 1 ]; then
-                cp "$f" "$OUT_MERGED"
-                FIRST=0
-              else
-                tail -n +2 "$f" >> "$OUT_MERGED"
-              fi
-            fi
-          done
-          if [ "$found_any" -eq 0 ]; then
-            echo "NO_RESULTS" > "$OUT_MERGED"
-          fi
-          echo "Merged file created: $OUT_MERGED (size $(wc -c < $OUT_MERGED) bytes)"
-
-      - name: Merge samples (top 100 per batch -> de-duplicated sample)
-        run: |
-          mkdir -p merged
-          SAMP=merged/sample_top100_merged.csv
-          FIRST=1
-          for f in artifacts/*/sample_top100_batch*.csv; do
-            if [ -f "$f" ]; then
-              if [ "$FIRST" -eq 1 ]; then
-                cp "$f" "$SAMP"
-                FIRST=0
-              else
-                tail -n +2 "$f" >> "$SAMP"
-              fi
-            fi
-          done
-          if [ ! -f "$SAMP" ]; then
-            echo "company,input_email,email,source,scraped,mx_ok,is_disposable,is_role,score,checked_at" > "$SAMP"
-          fi
-          awk -F, 'NR==1{print; next} !seen[$3]++' "$SAMP" > "${SAMP}.uniq" || true
-          mv "${SAMP}.uniq" "$SAMP"
-
-      - name: Upload merged enriched CSV
-        uses: actions/upload-artifact@v4
-        with:
-          name: enriched-verified-merged
-          path: merged/enriched_verified_merged.csv
-
-      - name: Upload merged sample artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sample-top100-merged
-          path: merged/sample_top100_merged.csv
+          name: sample-top100-final
+          path: sample_top100_final.csv
